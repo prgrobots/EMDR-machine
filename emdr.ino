@@ -34,7 +34,7 @@ struct EMDRConfig {
   bool audioEnabled = true;
   bool tactileEnabled = true;
   
-  int speed = 1000;
+  int speed = 1000;  // Time for full sweep (left to right)
   int cycles = 10;
   int brightness = 128;
   int colorR = 255;
@@ -44,10 +44,11 @@ struct EMDRConfig {
   int vibeIntensity = 200;
   
   int currentCycle = 0;
-  bool leftActive = true;
+  int currentPos = 0;  // Current LED position (0 to NUM_LEDS-1)
+  bool movingRight = true;  // Direction of sweep
 } config;
 
-unsigned long lastToggle = 0;
+unsigned long lastUpdate = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -101,23 +102,40 @@ void loop() {
   // EMDR cycle logic
   if (config.running) {
     unsigned long now = millis();
-    int halfCycle = config.speed / 2;
+    // Calculate delay per LED step
+    int stepDelay = config.speed / (NUM_LEDS - 1);
     
-    if (now - lastToggle >= halfCycle) {
-      lastToggle = now;
-      config.leftActive = !config.leftActive;
+    if (now - lastUpdate >= stepDelay) {
+      lastUpdate = now;
       
-      if (config.leftActive) {
-        config.currentCycle++;
-        if (config.currentCycle > config.cycles) {
-          stopSession();
-          sendState();
-          return;
+      // Move the position
+      if (config.movingRight) {
+        config.currentPos++;
+        if (config.currentPos >= NUM_LEDS - 1) {
+          config.currentPos = NUM_LEDS - 1;
+          config.movingRight = false;
+          triggerBeepAndVibe(false);  // Right side beep
+        }
+      } else {
+        config.currentPos--;
+        if (config.currentPos <= 0) {
+          config.currentPos = 0;
+          config.movingRight = true;
+          config.currentCycle++;
+          triggerBeepAndVibe(true);  // Left side beep
+          
+          if (config.currentCycle > config.cycles) {
+            stopSession();
+            sendState();
+            return;
+          }
         }
       }
       
       updateOutputs();
-      sendCycle();
+      if (config.currentPos == 0 && config.movingRight) {
+        sendCycle();  // Update cycle count
+      }
     }
   }
   
@@ -125,20 +143,27 @@ void loop() {
 }
 
 void updateOutputs() {
-  // Update LEDs
+  // Update LEDs - single moving dot with trail
   if (config.visualEnabled) {
-    int halfLeds = NUM_LEDS / 2;
+    // Create color - WS2812B uses GRB order but FastLED handles this
     CRGB color = CRGB(config.colorR, config.colorG, config.colorB);
     
-    for (int i = 0; i < NUM_LEDS; i++) {
-      if (config.leftActive && i < halfLeds) {
-        leds[i] = color;
-      } else if (!config.leftActive && i >= halfLeds) {
-        leds[i] = color;
-      } else {
-        leds[i] = CRGB::Black;
-      }
+    // Clear all LEDs
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    
+    // Light up current position brighter
+    leds[config.currentPos] = color;
+    
+    // Optional: add trailing effect
+    if (config.currentPos > 0) {
+      leds[config.currentPos - 1] = color;
+      leds[config.currentPos - 1].fadeToBlackBy(180);
     }
+    if (config.currentPos < NUM_LEDS - 1) {
+      leds[config.currentPos + 1] = color;
+      leds[config.currentPos + 1].fadeToBlackBy(180);
+    }
+    
     FastLED.setBrightness(config.brightness);
     FastLED.show();
   } else {
@@ -146,24 +171,34 @@ void updateOutputs() {
     FastLED.show();
   }
   
+  // Debug: print color values
+  static unsigned long lastPrint = 0;
+  if (millis() - lastPrint > 2000) {
+    Serial.printf("Color R:%d G:%d B:%d\n", config.colorR, config.colorG, config.colorB);
+    lastPrint = millis();
+  }
+}
+
+void triggerBeepAndVibe(bool isLeft) {
   // Update motors
   if (config.tactileEnabled) {
-    if (config.leftActive) {
+    if (isLeft) {
       analogWrite(MOTOR_LEFT_PWM, config.vibeIntensity);
       analogWrite(MOTOR_RIGHT_PWM, 0);
+      delay(300);  // Brief pulse
+      analogWrite(MOTOR_LEFT_PWM, 0);
     } else {
       analogWrite(MOTOR_LEFT_PWM, 0);
       analogWrite(MOTOR_RIGHT_PWM, config.vibeIntensity);
+      delay(300);  // Brief pulse
+      analogWrite(MOTOR_RIGHT_PWM, 0);
     }
-  } else {
-    analogWrite(MOTOR_LEFT_PWM, 0);
-    analogWrite(MOTOR_RIGHT_PWM, 0);
   }
   
   // Send audio trigger
   if (config.audioEnabled) {
     String msg = "{\"audio\":true,\"side\":\"";
-    msg += config.leftActive ? "left" : "right";
+    msg += isLeft ? "left" : "right";
     msg += "\",\"freq\":";
     msg += config.beepFreq;
     msg += "}";
@@ -228,8 +263,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     if (msg.startsWith("start")) {
       config.running = true;
       config.currentCycle = 0;
-      config.leftActive = true;
-      lastToggle = millis();
+      config.currentPos = 0;
+      config.movingRight = true;
+      lastUpdate = millis();
       updateOutputs();
       sendState();
     }
@@ -247,8 +283,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
       config.brightness = msg.substring(11).toInt();
     }
     else if (msg.startsWith("color:")) {
-      sscanf(msg.substring(6).c_str(), "%d,%d,%d", 
-             &config.colorR, &config.colorG, &config.colorB);
+      int r, g, b;
+      if (sscanf(msg.substring(6).c_str(), "%d,%d,%d", &r, &g, &b) == 3) {
+        config.colorR = r;
+        config.colorG = g;
+        config.colorB = b;
+      }
     }
     else if (msg.startsWith("beep:")) {
       config.beepFreq = msg.substring(5).toInt();
@@ -405,9 +445,9 @@ String getHTML() {
     <div class="progress" id="progress">0 / 10</div>
     
     <div class="toggles">
-      <button class="toggle on" id="vis"> Visual</button>
-      <button class="toggle on" id="aud"> Audio</button>
-      <button class="toggle on" id="tac"> Tactile</button>
+      <button class="toggle on" id="vis">Visual</button>
+      <button class="toggle on" id="aud">Audio</button>
+      <button class="toggle on" id="tac">Tactile</button>
     </div>
     
     <div class="group">
@@ -445,8 +485,8 @@ String getHTML() {
       <div class="val" id="vibV">200</div>
     </div>
     
-    <button class="btn start" id="start">▶ Start</button>
-    <button class="btn stop" id="stop">■ Stop</button>
+    <button class="btn start" id="start">Start</button>
+    <button class="btn stop" id="stop">Stop</button>
   </div>
 
   <script>
@@ -523,6 +563,7 @@ String getHTML() {
       const r = parseInt(h.substr(1,2), 16);
       const g = parseInt(h.substr(3,2), 16);
       const b = parseInt(h.substr(5,2), 16);
+      console.log('Color picked:', h, 'RGB:', r, g, b);
       ws.send('color:' + r + ',' + g + ',' + b);
     };
     
