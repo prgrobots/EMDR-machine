@@ -808,7 +808,7 @@ String getHTML() {
       pan.connect(ctx.destination);
       
       osc.frequency.value = freq;
-      pan.pan.value = side === 'left' ? -0.8 : 0.8;
+      pan.pan.value = side === 'left' ? -1 : 1;
       gain.gain.value = 0.3;
       gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.1);
       
