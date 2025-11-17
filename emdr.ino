@@ -12,7 +12,7 @@
 #define RED_POT_PIN A5
 #define GREEN_POT_PIN A6
 #define BLUE_POT_PIN A7
-
+ 
 CRGB leds[NUM_LEDS];
 int potSpeed = A0;
 int potTone = A1;
