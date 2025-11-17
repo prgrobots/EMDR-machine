@@ -4,38 +4,31 @@
 #include <FastLED.h>
 
 // Pin definitions for ESP8266 Motor Shield
-// Motor A (left motor)
-#define MOTOR_LEFT_PWM D1    // PWM to control speed
-#define MOTOR_LEFT_IN1 D3    // Set HIGH
-#define MOTOR_LEFT_IN2 D4    // Set HIGH
-
-// Motor B (right motor)  
-#define MOTOR_RIGHT_PWM D2   // PWM to control speed
-#define MOTOR_RIGHT_IN3 D5   // Set HIGH
-#define MOTOR_RIGHT_IN4 D6   // Set HIGH
-
-// LED strip
+#define MOTOR_LEFT_PWM D1
+#define MOTOR_LEFT_IN1 D3
+#define MOTOR_LEFT_IN2 D4
+#define MOTOR_RIGHT_PWM D2
+#define MOTOR_RIGHT_IN3 D5
+#define MOTOR_RIGHT_IN4 D6
 #define LED_PIN D7
-#define NUM_LEDS 20  // Reduced for ESP8266 memory
+#define NUM_LEDS 20
 
 CRGB leds[NUM_LEDS];
 
-// WiFi AP credentials
 const char* ssid = "EMDR-Control";
 const char* password = "emdr1234";
 
 ESP8266WebServer server(80);
 WebSocketsServer webSocket(81);
 
-// EMDR parameters
 struct EMDRConfig {
   bool running = false;
   bool visualEnabled = true;
   bool audioEnabled = true;
   bool tactileEnabled = true;
   
-  int speed = 1000;  // Time for full sweep (left to right)
-  int cycles = 10;
+  int speed = 1000;
+  int cycleDuration = 30;
   int brightness = 128;
   int colorR = 255;
   int colorG = 255;
@@ -43,9 +36,12 @@ struct EMDRConfig {
   int beepFreq = 800;
   int vibeIntensity = 200;
   
-  int currentCycle = 0;
-  int currentPos = 0;  // Current LED position (0 to NUM_LEDS-1)
-  bool movingRight = true;  // Direction of sweep
+  int desensThreshold = 5;
+  int beliefThreshold = 5;
+  
+  unsigned long phaseStartTime = 0;
+  int currentPos = 0;
+  bool movingRight = true;
 } config;
 
 unsigned long lastUpdate = 0;
@@ -53,11 +49,9 @@ unsigned long lastUpdate = 0;
 void setup() {
   Serial.begin(115200);
   
-  // Initialize LED strip
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(config.brightness);
   
-  // Initialize motor pins
   pinMode(MOTOR_LEFT_PWM, OUTPUT);
   pinMode(MOTOR_LEFT_IN1, OUTPUT);
   pinMode(MOTOR_LEFT_IN2, OUTPUT);
@@ -65,30 +59,25 @@ void setup() {
   pinMode(MOTOR_RIGHT_IN3, OUTPUT);
   pinMode(MOTOR_RIGHT_IN4, OUTPUT);
   
-  // Set direction pins HIGH (motors always "forward")
   digitalWrite(MOTOR_LEFT_IN1, HIGH);
   digitalWrite(MOTOR_LEFT_IN2, HIGH);
   digitalWrite(MOTOR_RIGHT_IN3, HIGH);
   digitalWrite(MOTOR_RIGHT_IN4, HIGH);
   
-  // Motors off initially
   analogWrite(MOTOR_LEFT_PWM, 0);
   analogWrite(MOTOR_RIGHT_PWM, 0);
   
-  // Start WiFi AP
   WiFi.softAP(ssid, password);
   Serial.println("WiFi AP started");
   Serial.print("IP: ");
   Serial.println(WiFi.softAPIP());
   
-  // Setup web server
   server.on("/", handleRoot);
   server.onNotFound([]() {
     server.send(404, "text/plain", "Not found");
   });
   server.begin();
   
-  // Start WebSocket
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
   
@@ -99,62 +88,50 @@ void loop() {
   server.handleClient();
   webSocket.loop();
   
-  // EMDR cycle logic
   if (config.running) {
+    unsigned long elapsed = (millis() - config.phaseStartTime) / 1000;
+    if (elapsed >= config.cycleDuration) {
+      stopSession();
+      sendComplete();
+      return;
+    }
+    
     unsigned long now = millis();
-    // Calculate delay per LED step
     int stepDelay = config.speed / (NUM_LEDS - 1);
     
     if (now - lastUpdate >= stepDelay) {
       lastUpdate = now;
       
-      // Move the position
       if (config.movingRight) {
         config.currentPos++;
         if (config.currentPos >= NUM_LEDS - 1) {
           config.currentPos = NUM_LEDS - 1;
           config.movingRight = false;
-          triggerBeepAndVibe(false);  // Right side beep
+          triggerBeepAndVibe(false);
         }
       } else {
         config.currentPos--;
         if (config.currentPos <= 0) {
           config.currentPos = 0;
           config.movingRight = true;
-          config.currentCycle++;
-          triggerBeepAndVibe(true);  // Left side beep
-          
-          if (config.currentCycle > config.cycles) {
-            stopSession();
-            sendState();
-            return;
-          }
+          triggerBeepAndVibe(true);
         }
       }
       
       updateOutputs();
-      if (config.currentPos == 0 && config.movingRight) {
-        sendCycle();  // Update cycle count
-      }
+      sendProgress();
     }
   }
   
-  yield(); // Important for ESP8266
+  yield();
 }
 
 void updateOutputs() {
-  // Update LEDs - single moving dot with trail
   if (config.visualEnabled) {
-    // Create color - WS2812B uses GRB order but FastLED handles this
     CRGB color = CRGB(config.colorR, config.colorG, config.colorB);
-    
-    // Clear all LEDs
     fill_solid(leds, NUM_LEDS, CRGB::Black);
     
-    // Light up current position brighter
     leds[config.currentPos] = color;
-    
-    // Optional: add trailing effect
     if (config.currentPos > 0) {
       leds[config.currentPos - 1] = color;
       leds[config.currentPos - 1].fadeToBlackBy(180);
@@ -170,32 +147,23 @@ void updateOutputs() {
     fill_solid(leds, NUM_LEDS, CRGB::Black);
     FastLED.show();
   }
-  
-  // Debug: print color values
-  static unsigned long lastPrint = 0;
-  if (millis() - lastPrint > 2000) {
-    Serial.printf("Color R:%d G:%d B:%d\n", config.colorR, config.colorG, config.colorB);
-    lastPrint = millis();
-  }
 }
 
 void triggerBeepAndVibe(bool isLeft) {
-  // Update motors
   if (config.tactileEnabled) {
     if (isLeft) {
       analogWrite(MOTOR_LEFT_PWM, config.vibeIntensity);
       analogWrite(MOTOR_RIGHT_PWM, 0);
-      delay(300);  // Brief pulse
+      delay(100);
       analogWrite(MOTOR_LEFT_PWM, 0);
     } else {
       analogWrite(MOTOR_LEFT_PWM, 0);
       analogWrite(MOTOR_RIGHT_PWM, config.vibeIntensity);
-      delay(300);  // Brief pulse
+      delay(100);
       analogWrite(MOTOR_RIGHT_PWM, 0);
     }
   }
   
-  // Send audio trigger
   if (config.audioEnabled) {
     String msg = "{\"audio\":true,\"side\":\"";
     msg += isLeft ? "left" : "right";
@@ -208,12 +176,15 @@ void triggerBeepAndVibe(bool isLeft) {
 
 void stopSession() {
   config.running = false;
-  config.currentCycle = 0;
-  
   fill_solid(leds, NUM_LEDS, CRGB::Black);
   FastLED.show();
   analogWrite(MOTOR_LEFT_PWM, 0);
   analogWrite(MOTOR_RIGHT_PWM, 0);
+}
+
+void sendComplete() {
+  String msg = "{\"type\":\"complete\"}";
+  webSocket.broadcastTXT(msg);
 }
 
 void sendState() {
@@ -227,10 +198,8 @@ void sendState() {
   msg += config.tactileEnabled ? "true" : "false";
   msg += ",\"speed\":";
   msg += config.speed;
-  msg += ",\"cycles\":";
-  msg += config.cycles;
-  msg += ",\"currentCycle\":";
-  msg += config.currentCycle;
+  msg += ",\"cycleDuration\":";
+  msg += config.cycleDuration;
   msg += ",\"brightness\":";
   msg += config.brightness;
   msg += ",\"colorR\":";
@@ -243,15 +212,20 @@ void sendState() {
   msg += config.beepFreq;
   msg += ",\"vibeIntensity\":";
   msg += config.vibeIntensity;
+  msg += ",\"desensThreshold\":";
+  msg += config.desensThreshold;
+  msg += ",\"beliefThreshold\":";
+  msg += config.beliefThreshold;
   msg += "}";
   webSocket.broadcastTXT(msg);
 }
 
-void sendCycle() {
-  String msg = "{\"type\":\"cycle\",\"current\":";
-  msg += config.currentCycle;
+void sendProgress() {
+  unsigned long elapsed = (millis() - config.phaseStartTime) / 1000;
+  String msg = "{\"type\":\"progress\",\"elapsed\":";
+  msg += elapsed;
   msg += ",\"total\":";
-  msg += config.cycles;
+  msg += config.cycleDuration;
   msg += "}";
   webSocket.broadcastTXT(msg);
 }
@@ -262,9 +236,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     
     if (msg.startsWith("start")) {
       config.running = true;
-      config.currentCycle = 0;
       config.currentPos = 0;
       config.movingRight = true;
+      config.phaseStartTime = millis();
       lastUpdate = millis();
       updateOutputs();
       sendState();
@@ -276,19 +250,15 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     else if (msg.startsWith("speed:")) {
       config.speed = msg.substring(6).toInt();
     }
-    else if (msg.startsWith("cycles:")) {
-      config.cycles = msg.substring(7).toInt();
+    else if (msg.startsWith("cycleDuration:")) {
+      config.cycleDuration = msg.substring(14).toInt();
     }
     else if (msg.startsWith("brightness:")) {
       config.brightness = msg.substring(11).toInt();
     }
     else if (msg.startsWith("color:")) {
-      int r, g, b;
-      if (sscanf(msg.substring(6).c_str(), "%d,%d,%d", &r, &g, &b) == 3) {
-        config.colorR = r;
-        config.colorG = g;
-        config.colorB = b;
-      }
+      sscanf(msg.substring(6).c_str(), "%d,%d,%d", 
+             &config.colorR, &config.colorG, &config.colorB);
     }
     else if (msg.startsWith("beep:")) {
       config.beepFreq = msg.substring(5).toInt();
@@ -304,6 +274,12 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
     }
     else if (msg.startsWith("tactile:")) {
       config.tactileEnabled = msg.substring(8) == "1";
+    }
+    else if (msg.startsWith("desensThreshold:")) {
+      config.desensThreshold = msg.substring(16).toInt();
+    }
+    else if (msg.startsWith("beliefThreshold:")) {
+      config.beliefThreshold = msg.substring(16).toInt();
     }
     else if (msg == "getState") {
       sendState();
@@ -325,28 +301,79 @@ String getHTML() {
 <html>
 <head>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>EMDR</title>
+  <title>EMDR Control</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
       font-family: Arial, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      background: #1a1a1a;
       min-height: 100vh;
       padding: 15px;
+      color: #e0e0e0;
     }
     .container {
       max-width: 480px;
       margin: 0 auto;
-      background: white;
+      background: #2a2a2a;
       border-radius: 15px;
       padding: 20px;
-      box-shadow: 0 8px 30px rgba(0,0,0,0.3);
+      box-shadow: 0 8px 30px rgba(0,0,0,0.5);
     }
     h1 {
       text-align: center;
-      color: #667eea;
+      color: #4a9eff;
       margin-bottom: 20px;
       font-size: 24px;
+    }
+    h2 {
+      color: #4a9eff;
+      margin-bottom: 15px;
+      font-size: 18px;
+    }
+    .mode-select {
+      display: flex;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .mode-btn {
+      flex: 1;
+      padding: 15px;
+      border: 2px solid #4a9eff;
+      background: #2a2a2a;
+      color: #4a9eff;
+      border-radius: 8px;
+      font-weight: 600;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    .mode-btn.active {
+      background: #4a9eff;
+      color: #1a1a1a;
+    }
+    .screen {
+      display: none;
+    }
+    .screen.active {
+      display: block;
+    }
+    .input-group {
+      margin-bottom: 15px;
+    }
+    label {
+      display: block;
+      font-weight: 600;
+      margin-bottom: 8px;
+      color: #b0b0b0;
+      font-size: 14px;
+    }
+    input[type="number"] {
+      width: 100%;
+      padding: 10px;
+      background: #1a1a1a;
+      border: 2px solid #444;
+      border-radius: 8px;
+      color: #e0e0e0;
+      font-size: 16px;
     }
     .status {
       text-align: center;
@@ -356,17 +383,17 @@ String getHTML() {
       margin-bottom: 15px;
       font-size: 16px;
     }
-    .running { background: #d1fae5; color: #065f46; }
-    .stopped { background: #fee2e2; color: #991b1b; }
+    .running { background: #1e4620; color: #4ade80; }
+    .stopped { background: #4a1e1e; color: #f87171; }
     .progress {
       text-align: center;
       padding: 12px;
-      background: #f0f4ff;
+      background: #1e293b;
       border-radius: 8px;
       margin-bottom: 15px;
       font-size: 22px;
       font-weight: 700;
-      color: #667eea;
+      color: #4a9eff;
     }
     .toggles {
       display: flex;
@@ -376,48 +403,42 @@ String getHTML() {
     .toggle {
       flex: 1;
       padding: 10px;
-      border: 2px solid #667eea;
-      background: white;
-      color: #667eea;
+      border: 2px solid #4a9eff;
+      background: #2a2a2a;
+      color: #4a9eff;
       border-radius: 8px;
       font-weight: 600;
       cursor: pointer;
       font-size: 14px;
     }
     .toggle.on {
-      background: #667eea;
-      color: white;
+      background: #4a9eff;
+      color: #1a1a1a;
     }
     .group {
       margin-bottom: 15px;
       padding: 12px;
-      background: #f8f9fa;
+      background: #1e1e1e;
       border-radius: 8px;
-    }
-    label {
-      display: block;
-      font-weight: 600;
-      margin-bottom: 6px;
-      font-size: 13px;
-      color: #333;
     }
     input[type="range"] {
       width: 100%;
       height: 5px;
       border-radius: 3px;
-      background: #ddd;
+      background: #444;
       outline: none;
     }
     input[type="color"] {
       width: 100%;
       height: 45px;
-      border: none;
+      border: 2px solid #444;
       border-radius: 8px;
       cursor: pointer;
+      background: #1a1a1a;
     }
     .val {
       text-align: right;
-      color: #667eea;
+      color: #4a9eff;
       font-weight: 600;
       font-size: 13px;
       margin-top: 4px;
@@ -435,63 +456,247 @@ String getHTML() {
     }
     .start { background: #10b981; color: white; }
     .stop { background: #ef4444; color: white; }
+    .next { background: #4a9eff; color: white; }
+    .reset { background: #f59e0b; color: white; }
+    .prompt {
+      background: #1e293b;
+      padding: 15px;
+      border-radius: 8px;
+      margin-bottom: 15px;
+      text-align: center;
+      font-size: 16px;
+      line-height: 1.5;
+    }
+    .scale-input {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .scale-input input {
+      flex: 1;
+    }
   </style>
 </head>
 <body>
   <div class="container">
     <h1>EMDR Control</h1>
     
-    <div class="status stopped" id="status">Stopped</div>
-    <div class="progress" id="progress">0 / 10</div>
-    
-    <div class="toggles">
-      <button class="toggle on" id="vis">Visual</button>
-      <button class="toggle on" id="aud">Audio</button>
-      <button class="toggle on" id="tac">Tactile</button>
+    <div class="mode-select">
+      <button class="mode-btn active" id="guidedBtn">Guided Session</button>
+      <button class="mode-btn" id="manualBtn">Manual Session</button>
     </div>
-    
-    <div class="group">
-      <label>Speed</label>
-      <input type="range" id="spd" min="200" max="3000" value="1000" step="100">
-      <div class="val" id="spdV">1000 ms</div>
+
+    <!-- Guided Session Screens -->
+    <div id="guidedSetup" class="screen active">
+      <h2>Session Setup</h2>
+      
+      <div class="input-group">
+        <label>Cycle Duration (seconds)</label>
+        <input type="number" id="setupDuration" value="30" min="10" max="300">
+      </div>
+      
+      <div class="input-group">
+        <label>Desensitization Continue Threshold (0-10)</label>
+        <input type="number" id="setupDesens" value="5" min="0" max="10">
+      </div>
+      
+      <div class="input-group">
+        <label>Belief Stop Threshold (0-7)</label>
+        <input type="number" id="setupBelief" value="5" min="0" max="7">
+      </div>
+      
+      <button class="btn next" id="setupNext">Begin Session</button>
     </div>
-    
-    <div class="group">
-      <label>Cycles</label>
-      <input type="range" id="cyc" min="1" max="50" value="10">
-      <div class="val" id="cycV">10</div>
+
+    <div id="guidedDesens" class="screen">
+      <h2>Desensitization Phase</h2>
+      <div class="prompt">Focus on the target event</div>
+      
+      <div class="status stopped" id="statusDesens">Stopped</div>
+      <div class="progress" id="progressDesens">0:00 / 0:30</div>
+      
+      <div id="desensControls">
+        <div class="toggles">
+          <button class="toggle on" id="visDesens">Visual</button>
+          <button class="toggle on" id="audDesens">Audio</button>
+          <button class="toggle on" id="tacDesens">Tactile</button>
+        </div>
+        
+        <div class="group">
+          <label>Speed</label>
+          <input type="range" id="spdDesens" min="200" max="3000" value="1000" step="100">
+          <div class="val" id="spdDesensV">1000 ms</div>
+        </div>
+        
+        <div class="group">
+          <label>Brightness</label>
+          <input type="range" id="briDesens" min="10" max="255" value="128">
+          <div class="val" id="briDesensV">128</div>
+        </div>
+        
+        <div class="group">
+          <label>Color</label>
+          <input type="color" id="colDesens" value="#ffffff">
+        </div>
+        
+        <div class="group">
+          <label>Beep Frequency</label>
+          <input type="range" id="bepDesens" min="200" max="2000" value="800" step="50">
+          <div class="val" id="bepDesensV">800 Hz</div>
+        </div>
+        
+        <div class="group">
+          <label>Vibration</label>
+          <input type="range" id="vibDesens" min="0" max="255" value="200">
+          <div class="val" id="vibDesensV">200</div>
+        </div>
+      </div>
+      
+      <button class="btn start" id="startDesens">Start Cycle</button>
+      <button class="btn stop" id="stopDesens" style="display:none;">Stop</button>
     </div>
-    
-    <div class="group">
-      <label>Brightness</label>
-      <input type="range" id="bri" min="10" max="255" value="128">
-      <div class="val" id="briV">128</div>
+
+    <div id="guidedDesensScore" class="screen">
+      <h2>Desensitization Phase</h2>
+      <div class="prompt">Rate your current level of disturbance (0-10)<br>0 = No disturbance, 10 = Highest disturbance</div>
+      
+      <div class="scale-input">
+        <label>Score:</label>
+        <input type="number" id="desensScore" value="5" min="0" max="10">
+      </div>
+      
+      <button class="btn next" id="desensScoreNext">Continue</button>
+      <button class="btn reset" id="resetFromDesens">Reset Session</button>
     </div>
-    
-    <div class="group">
-      <label>Color</label>
-      <input type="color" id="col" value="#ffffff">
+
+    <div id="guidedReprocess" class="screen">
+      <h2>Reprocessing Phase</h2>
+      <div class="prompt">Focus on the positive belief</div>
+      
+      <div class="status stopped" id="statusReprocess">Stopped</div>
+      <div class="progress" id="progressReprocess">0:00 / 0:30</div>
+      
+      <div id="reprocessControls">
+        <div class="toggles">
+          <button class="toggle on" id="visReprocess">Visual</button>
+          <button class="toggle on" id="audReprocess">Audio</button>
+          <button class="toggle on" id="tacReprocess">Tactile</button>
+        </div>
+        
+        <div class="group">
+          <label>Speed</label>
+          <input type="range" id="spdReprocess" min="200" max="3000" value="1000" step="100">
+          <div class="val" id="spdReprocessV">1000 ms</div>
+        </div>
+        
+        <div class="group">
+          <label>Brightness</label>
+          <input type="range" id="briReprocess" min="10" max="255" value="128">
+          <div class="val" id="briReprocessV">128</div>
+        </div>
+        
+        <div class="group">
+          <label>Color</label>
+          <input type="color" id="colReprocess" value="#ffffff">
+        </div>
+        
+        <div class="group">
+          <label>Beep Frequency</label>
+          <input type="range" id="bepReprocess" min="200" max="2000" value="800" step="50">
+          <div class="val" id="bepReprocessV">800 Hz</div>
+        </div>
+        
+        <div class="group">
+          <label>Vibration</label>
+          <input type="range" id="vibReprocess" min="0" max="255" value="200">
+          <div class="val" id="vibReprocessV">200</div>
+        </div>
+      </div>
+      
+      <button class="btn start" id="startReprocess">Start Cycle</button>
+      <button class="btn stop" id="stopReprocess" style="display:none;">Stop</button>
     </div>
-    
-    <div class="group">
-      <label>Beep Frequency</label>
-      <input type="range" id="bep" min="200" max="2000" value="800" step="50">
-      <div class="val" id="bepV">800 Hz</div>
+
+    <div id="guidedBeliefScore" class="screen">
+      <h2>Reprocessing Phase</h2>
+      <div class="prompt">Rate your belief in the positive statement (0-7)<br>0 = Completely false, 7 = Completely true</div>
+      
+      <div class="scale-input">
+        <label>Score:</label>
+        <input type="number" id="beliefScore" value="3" min="0" max="7">
+      </div>
+      
+      <button class="btn next" id="beliefScoreNext">Continue</button>
+      <button class="btn reset" id="resetFromBelief">Reset Session</button>
     </div>
-    
-    <div class="group">
-      <label>Vibration</label>
-      <input type="range" id="vib" min="0" max="255" value="200">
-      <div class="val" id="vibV">200</div>
+
+    <div id="guidedComplete" class="screen">
+      <h2>Session Complete</h2>
+      <div class="prompt">Your EMDR session is complete</div>
+      <button class="btn reset" id="resetComplete">Start New Session</button>
     </div>
-    
-    <button class="btn start" id="start">Start</button>
-    <button class="btn stop" id="stop">Stop</button>
+
+    <!-- Manual Session Screen -->
+    <div id="manualSession" class="screen">
+      <h2>Manual Session</h2>
+      
+      <div class="status stopped" id="statusManual">Stopped</div>
+      <div class="progress" id="progressManual">0:00 / 0:30</div>
+      
+      <div class="toggles">
+        <button class="toggle on" id="visManual">Visual</button>
+        <button class="toggle on" id="audManual">Audio</button>
+        <button class="toggle on" id="tacManual">Tactile</button>
+      </div>
+      
+      <div class="group">
+        <label>Duration</label>
+        <input type="range" id="durManual" min="10" max="300" value="30" step="10">
+        <div class="val" id="durManualV">30 seconds</div>
+      </div>
+      
+      <div class="group">
+        <label>Speed</label>
+        <input type="range" id="spdManual" min="200" max="3000" value="1000" step="100">
+        <div class="val" id="spdManualV">1000 ms</div>
+      </div>
+      
+      <div class="group">
+        <label>Brightness</label>
+        <input type="range" id="briManual" min="10" max="255" value="128">
+        <div class="val" id="briManualV">128</div>
+      </div>
+      
+      <div class="group">
+        <label>Color</label>
+        <input type="color" id="colManual" value="#ffffff">
+      </div>
+      
+      <div class="group">
+        <label>Beep Frequency</label>
+        <input type="range" id="bepManual" min="200" max="2000" value="800" step="50">
+        <div class="val" id="bepManualV">800 Hz</div>
+      </div>
+      
+      <div class="group">
+        <label>Vibration</label>
+        <input type="range" id="vibManual" min="0" max="255" value="200">
+        <div class="val" id="vibManualV">200</div>
+      </div>
+      
+      <button class="btn start" id="startManual">Start</button>
+      <button class="btn stop" id="stopManual">Stop</button>
+    </div>
   </div>
 
   <script>
     let ws;
     let ctx;
+    let isGuided = true;
+    let currentPhase = 'setup';
+    let desensThreshold = 5;
+    let beliefThreshold = 5;
     
     function connect() {
       ws = new WebSocket('ws://' + location.hostname + ':81');
@@ -505,14 +710,11 @@ String getHTML() {
         const d = JSON.parse(e.data);
         
         if (d.type === 'state') {
-          document.getElementById('status').textContent = d.running ? 'Running' : 'Stopped';
-          document.getElementById('status').className = d.running ? 'status running' : 'status stopped';
-          document.getElementById('progress').textContent = d.currentCycle + ' / ' + d.cycles;
-          document.getElementById('vis').classList.toggle('on', d.visual);
-          document.getElementById('aud').classList.toggle('on', d.audio);
-          document.getElementById('tac').classList.toggle('on', d.tactile);
-        } else if (d.type === 'cycle') {
-          document.getElementById('progress').textContent = d.current + ' / ' + d.total;
+          updateStatusAll(d.running);
+        } else if (d.type === 'progress') {
+          updateProgressAll(d.elapsed, d.total);
+        } else if (d.type === 'complete') {
+          handleCycleComplete();
         } else if (d.audio) {
           beep(d.side, d.freq);
         }
@@ -521,6 +723,51 @@ String getHTML() {
       ws.onclose = () => {
         setTimeout(connect, 2000);
       };
+    }
+    
+    function updateStatusAll(running) {
+      const status = running ? 'Running' : 'Stopped';
+      const className = running ? 'status running' : 'status stopped';
+      document.getElementById('statusDesens').textContent = status;
+      document.getElementById('statusDesens').className = className;
+      document.getElementById('statusReprocess').textContent = status;
+      document.getElementById('statusReprocess').className = className;
+      document.getElementById('statusManual').textContent = status;
+      document.getElementById('statusManual').className = className;
+      
+      if (running) {
+        document.getElementById('startDesens').style.display = 'none';
+        document.getElementById('stopDesens').style.display = 'block';
+        document.getElementById('startReprocess').style.display = 'none';
+        document.getElementById('stopReprocess').style.display = 'block';
+      } else {
+        document.getElementById('startDesens').style.display = 'block';
+        document.getElementById('stopDesens').style.display = 'none';
+        document.getElementById('startReprocess').style.display = 'block';
+        document.getElementById('stopReprocess').style.display = 'none';
+      }
+    }
+    
+    function updateProgressAll(elapsed, total) {
+      const eMin = Math.floor(elapsed / 60);
+      const eSec = elapsed % 60;
+      const tMin = Math.floor(total / 60);
+      const tSec = total % 60;
+      const text = eMin + ':' + (eSec < 10 ? '0' : '') + eSec + ' / ' +
+                   tMin + ':' + (tSec < 10 ? '0' : '') + tSec;
+      document.getElementById('progressDesens').textContent = text;
+      document.getElementById('progressReprocess').textContent = text;
+      document.getElementById('progressManual').textContent = text;
+    }
+    
+    function handleCycleComplete() {
+      if (isGuided) {
+        if (currentPhase === 'desens') {
+          showScreen('guidedDesensScore');
+        } else if (currentPhase === 'reprocess') {
+          showScreen('guidedBeliefScore');
+        }
+      }
     }
     
     function beep(side, freq) {
@@ -543,63 +790,158 @@ String getHTML() {
       osc.stop(ctx.currentTime + 0.1);
     }
     
-    document.getElementById('spd').oninput = (e) => {
-      document.getElementById('spdV').textContent = e.target.value + ' ms';
-      ws.send('speed:' + e.target.value);
+    function showScreen(screenId) {
+      document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+      document.getElementById(screenId).classList.add('active');
+    }
+    
+    function setupControls(prefix) {
+      document.getElementById('spd' + prefix).oninput = (e) => {
+        document.getElementById('spd' + prefix + 'V').textContent = e.target.value + ' ms';
+        ws.send('speed:' + e.target.value);
+      };
+      
+      document.getElementById('bri' + prefix).oninput = (e) => {
+        document.getElementById('bri' + prefix + 'V').textContent = e.target.value;
+        ws.send('brightness:' + e.target.value);
+      };
+      
+      document.getElementById('col' + prefix).oninput = (e) => {
+        const h = e.target.value;
+        const r = parseInt(h.substr(1,2), 16);
+        const g = parseInt(h.substr(3,2), 16);
+        const b = parseInt(h.substr(5,2), 16);
+        ws.send('color:' + r + ',' + g + ',' + b);
+      };
+      
+      document.getElementById('bep' + prefix).oninput = (e) => {
+        document.getElementById('bep' + prefix + 'V').textContent = e.target.value + ' Hz';
+        ws.send('beep:' + e.target.value);
+      };
+      
+      document.getElementById('vib' + prefix).oninput = (e) => {
+        document.getElementById('vib' + prefix + 'V').textContent = e.target.value;
+        ws.send('vibe:' + e.target.value);
+      };
+      
+      document.getElementById('vis' + prefix).onclick = (e) => {
+        e.target.classList.toggle('on');
+        ws.send('visual:' + (e.target.classList.contains('on') ? '1' : '0'));
+      };
+      
+      document.getElementById('aud' + prefix).onclick = (e) => {
+        e.target.classList.toggle('on');
+        ws.send('audio:' + (e.target.classList.contains('on') ? '1' : '0'));
+      };
+      
+      document.getElementById('tac' + prefix).onclick = (e) => {
+        e.target.classList.toggle('on');
+        ws.send('tactile:' + (e.target.classList.contains('on') ? '1' : '0'));
+      };
+    }
+    
+    // Mode selection
+    document.getElementById('guidedBtn').onclick = () => {
+      isGuided = true;
+      document.getElementById('guidedBtn').classList.add('active');
+      document.getElementById('manualBtn').classList.remove('active');
+      showScreen('guidedSetup');
     };
     
-    document.getElementById('cyc').oninput = (e) => {
-      document.getElementById('cycV').textContent = e.target.value;
-      ws.send('cycles:' + e.target.value);
+    document.getElementById('manualBtn').onclick = () => {
+      isGuided = false;
+      document.getElementById('manualBtn').classList.add('active');
+      document.getElementById('guidedBtn').classList.remove('active');
+      showScreen('manualSession');
     };
     
-    document.getElementById('bri').oninput = (e) => {
-      document.getElementById('briV').textContent = e.target.value;
-      ws.send('brightness:' + e.target.value);
+    // Guided session setup
+    document.getElementById('setupNext').onclick = () => {
+      const duration = parseInt(document.getElementById('setupDuration').value);
+      desensThreshold = parseInt(document.getElementById('setupDesens').value);
+      beliefThreshold = parseInt(document.getElementById('setupBelief').value);
+      
+      ws.send('cycleDuration:' + duration);
+      ws.send('desensThreshold:' + desensThreshold);
+      ws.send('beliefThreshold:' + beliefThreshold);
+      
+      currentPhase = 'desens';
+      showScreen('guidedDesens');
     };
     
-    document.getElementById('col').oninput = (e) => {
-      const h = e.target.value;
-      const r = parseInt(h.substr(1,2), 16);
-      const g = parseInt(h.substr(3,2), 16);
-      const b = parseInt(h.substr(5,2), 16);
-      console.log('Color picked:', h, 'RGB:', r, g, b);
-      ws.send('color:' + r + ',' + g + ',' + b);
-    };
-    
-    document.getElementById('bep').oninput = (e) => {
-      document.getElementById('bepV').textContent = e.target.value + ' Hz';
-      ws.send('beep:' + e.target.value);
-    };
-    
-    document.getElementById('vib').oninput = (e) => {
-      document.getElementById('vibV').textContent = e.target.value;
-      ws.send('vibe:' + e.target.value);
-    };
-    
-    document.getElementById('vis').onclick = (e) => {
-      e.target.classList.toggle('on');
-      ws.send('visual:' + (e.target.classList.contains('on') ? '1' : '0'));
-    };
-    
-    document.getElementById('aud').onclick = (e) => {
-      e.target.classList.toggle('on');
-      ws.send('audio:' + (e.target.classList.contains('on') ? '1' : '0'));
-    };
-    
-    document.getElementById('tac').onclick = (e) => {
-      e.target.classList.toggle('on');
-      ws.send('tactile:' + (e.target.classList.contains('on') ? '1' : '0'));
-    };
-    
-    document.getElementById('start').onclick = () => {
+    // Desensitization phase
+    document.getElementById('startDesens').onclick = () => {
       if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
       ws.send('start');
     };
     
-    document.getElementById('stop').onclick = () => {
+    document.getElementById('stopDesens').onclick = () => {
       ws.send('stop');
     };
+    
+    document.getElementById('desensScoreNext').onclick = () => {
+      const score = parseInt(document.getElementById('desensScore').value);
+      if (score > desensThreshold) {
+        showScreen('guidedDesens');
+      } else {
+        currentPhase = 'reprocess';
+        showScreen('guidedReprocess');
+      }
+    };
+    
+    // Reprocessing phase
+    document.getElementById('startReprocess').onclick = () => {
+      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+      ws.send('start');
+    };
+    
+    document.getElementById('stopReprocess').onclick = () => {
+      ws.send('stop');
+    };
+    
+    document.getElementById('beliefScoreNext').onclick = () => {
+      const score = parseInt(document.getElementById('beliefScore').value);
+      if (score < beliefThreshold) {
+        showScreen('guidedReprocess');
+      } else {
+        showScreen('guidedComplete');
+      }
+    };
+    
+    // Reset buttons
+    document.getElementById('resetFromDesens').onclick = () => {
+      showScreen('guidedSetup');
+      ws.send('stop');
+    };
+    
+    document.getElementById('resetFromBelief').onclick = () => {
+      showScreen('guidedSetup');
+      ws.send('stop');
+    };
+    
+    document.getElementById('resetComplete').onclick = () => {
+      showScreen('guidedSetup');
+    };
+    
+    // Manual session
+    document.getElementById('durManual').oninput = (e) => {
+      document.getElementById('durManualV').textContent = e.target.value + ' seconds';
+      ws.send('cycleDuration:' + e.target.value);
+    };
+    
+    document.getElementById('startManual').onclick = () => {
+      if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+      ws.send('start');
+    };
+    
+    document.getElementById('stopManual').onclick = () => {
+      ws.send('stop');
+    };
+    
+    // Setup all control handlers
+    setupControls('Desens');
+    setupControls('Reprocess');
+    setupControls('Manual');
     
     connect();
   </script>
