@@ -11,7 +11,7 @@
 #define MOTOR_RIGHT_IN3 D5
 #define MOTOR_RIGHT_IN4 D6
 #define LED_PIN D7
-#define NUM_LEDS 20
+#define NUM_LEDS 10
 
 CRGB leds[NUM_LEDS];
 
@@ -49,9 +49,11 @@ unsigned long lastUpdate = 0;
 void setup() {
   Serial.begin(115200);
   
-  FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
+  FastLED.addLeds<WS2812B, LED_PIN, BRG>(leds, NUM_LEDS);
   FastLED.setBrightness(config.brightness);
-  
+  FastLED.clear();
+  FastLED.show();
+
   pinMode(MOTOR_LEFT_PWM, OUTPUT);
   pinMode(MOTOR_LEFT_IN1, OUTPUT);
   pinMode(MOTOR_LEFT_IN2, OUTPUT);
@@ -125,21 +127,16 @@ void loop() {
   
   yield();
 }
-
+// sold output - no trails
 void updateOutputs() {
   if (config.visualEnabled) {
     CRGB color = CRGB(config.colorR, config.colorG, config.colorB);
+    
+    // Clear all LEDs
     fill_solid(leds, NUM_LEDS, CRGB::Black);
     
+    // Light up ONLY the current position (single LED)
     leds[config.currentPos] = color;
-    if (config.currentPos > 0) {
-      leds[config.currentPos - 1] = color;
-      leds[config.currentPos - 1].fadeToBlackBy(180);
-    }
-    if (config.currentPos < NUM_LEDS - 1) {
-      leds[config.currentPos + 1] = color;
-      leds[config.currentPos + 1].fadeToBlackBy(180);
-    }
     
     FastLED.setBrightness(config.brightness);
     FastLED.show();
@@ -148,6 +145,35 @@ void updateOutputs() {
     FastLED.show();
   }
 }
+
+
+// has trails
+
+// void updateOutputs() {
+//   if (config.visualEnabled) {
+//     CRGB color = CRGB(config.colorR, config.colorG, config.colorB);
+//     fill_solid(leds, NUM_LEDS, CRGB::Black);
+    
+
+//         leds[config.currentPos] = color;
+
+//     // Trailing effect - these create the "comet tail"
+//     if (config.currentPos > 0) {
+//       leds[config.currentPos - 1] = color;
+//       leds[config.currentPos - 1].fadeToBlackBy(250);
+//     }
+//     if (config.currentPos < NUM_LEDS - 1) {
+//       leds[config.currentPos + 1] = color;
+//       leds[config.currentPos + 1].fadeToBlackBy(250);
+//     }
+    
+//     FastLED.setBrightness(config.brightness);
+//     FastLED.show();
+//   } else {
+//     fill_solid(leds, NUM_LEDS, CRGB::Black);
+//     FastLED.show();
+//   }
+// }
 
 void triggerBeepAndVibe(bool isLeft) {
   if (config.tactileEnabled) {
@@ -525,7 +551,7 @@ String getHTML() {
         
         <div class="group">
           <label>Speed</label>
-          <input type="range" id="spdDesens" min="200" max="3000" value="1000" step="100">
+          <input type="range" id="spdDesens" min="200" max="1000" value="500" step="30">
           <div class="val" id="spdDesensV">1000 ms</div>
         </div>
         
@@ -586,7 +612,7 @@ String getHTML() {
         
         <div class="group">
           <label>Speed</label>
-          <input type="range" id="spdReprocess" min="200" max="3000" value="1000" step="100">
+          <input type="range" id="spdReprocess" min="200" max="1000" value="500" step="30">
           <div class="val" id="spdReprocessV">1000 ms</div>
         </div>
         
@@ -658,7 +684,7 @@ String getHTML() {
       
       <div class="group">
         <label>Speed</label>
-        <input type="range" id="spdManual" min="200" max="3000" value="1000" step="100">
+        <input type="range" id="spdManual" min="200" max="1000" value="500" step="30">
         <div class="val" id="spdManualV">1000 ms</div>
       </div>
       
